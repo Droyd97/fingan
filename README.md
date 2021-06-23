@@ -1,2 +1,2 @@
-# FinGAN
+# FinGAN
 

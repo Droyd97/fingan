@@ -1,3 +1,5 @@
+import os
+import logging
 import torch
 from torch import nn
 from torch.nn.utils import spectral_norm
@@ -10,18 +12,18 @@ from pytorch_model_summary import summary
 from tqdm import tqdm
 import numpy as np
 
+from fingan.models.model import Model
 
-class RaGAN():
+
+class RaGAN(Model):
     """ RaGAN """
-    def __init__(self, workers=2, batchSize=128, num_epochs=100, n_critic=5, lr=0.0002, beta1=0.5, ngpu=0):
-        # Number of workers for dataloader
-        self.workers = workers
+    def __init__(self, wkdir=None, is_logging=False, workers=2, batch_size=128,
+                 num_epochs=200, save_point=50, ngpu=0, n_critic=5, lr=0.0002, beta1=0.5):
 
-        # Batch size during training
-        self.batch = batchSize
+        super().__init__('RaGAN', wkdir, is_logging, batch_size, workers, num_epochs, save_point, ngpu)
 
-        # Number of training epochs
-        self.num_epochs = num_epochs
+        # Set device to run on
+        self.device = torch.device("cuda:0" if (torch.cuda.is_available() and self.ngpu > 0) else "cpu")
 
         # Number of critic iterations per iteration of the generator
         self.n_critic = n_critic
@@ -31,12 +33,6 @@ class RaGAN():
 
         # Beta1 hyperparameter for Adam optimizers
         self.beta1 = 0.5
-
-        # Number of GPUs available. Use 0 for CPU mode
-        self.ngpu = ngpu
-
-        # Set device to run on
-        self.device = torch.device("cuda:0" if (torch.cuda.is_available() and ngpu > 0) else "cpu")
 
         # Create Generator
         self.net_g = self.Generator(self.ngpu).to(self.device)
@@ -48,7 +44,7 @@ class RaGAN():
         self.noiseLength = 100
 
         # Track Losses
-        self.losses = {'g': [], 'c': [], 'gp': [], 'gradNorm': [], 'iter': 0}
+        self.losses = {'g': torch.zeros(num_epochs), 'c': torch.zeros(num_epochs), 'gp': [], 'gradNorm': [], 'iter': 0}
 
         # Gradient penalty weight
         self.gp_weight = 1
@@ -156,19 +152,36 @@ class RaGAN():
             # print(combine.shape)
             return self.critic_architecture(combine)
 
-    def train(self, data, num_epochs):
-        dataloader = DataLoader(data, 10)
+    def train(self, dataset, name=None):
+        # Set working directory to current one if not provided
+        if self.wkdir is None:
+            self.wkdir = os.getcwd()
+
+        # Set file path
+        if name is None:
+            file_path = self.wkdir + self.name + "-save.pt"
+        else:
+            file_path = self.wkdir + name + "-save.pt"
+
+        start_epoch = 0
+
+        if os.path.isfile(file_path):
+            epoch = self.load(file_path)
+            start_epoch = epoch - 1
+            print("Loaded saved model")
+
+        dataloader = DataLoader(dataset, self.batch_size)
 
         print("Starting Training Loop...")
 
-        for epoch in tqdm(range(num_epochs)):
+        for epoch in tqdm(range(start_epoch, self.num_epochs)):
             for i, data in enumerate(dataloader, 0):
                 loss = nn.BCEWithLogitsLoss()
 
-                base1 = data[:5, :, 0]
-                base2 = data[5:, :, 0]
-                associated1 = data[:5, :, 1]
-                associated2 = data[5:, :, 1]
+                base1 = data[:, :, 0]
+                base2 = data[:, :, 0]
+                associated1 = data[:, :, 1]
+                associated2 = data[:, :, 1]
                 # print(base1.shape, base2.shape, associated.shape)
                 b_size = base1.size()[0]
 
@@ -199,7 +212,7 @@ class RaGAN():
 
                     self.optimiserC.step()
 
-                self.losses['c'].append(d_loss.detach().numpy())
+                self.losses['c'][epoch] = d_loss.data.item()
 
                 b_size = base2.size()[0]
                 noise = torch.randn(b_size, self.noiseLength, device=self.device)
@@ -220,13 +233,41 @@ class RaGAN():
                           + loss(c_fake - c_real_av, target_real)) / 2
                     
                 g_loss.backward()
-                self.losses['g'].append(g_loss.detach().numpy())
+                self.losses['g'][epoch] = g_loss.data.item()
                 self.optimiserG.step()
+
+                if self.is_logging:
+                    logging.info("Critic loss: {}".format(self.losses['c'][epoch]))
+                    logging.info("Generator loss: {}".format(self.losses['g'][epoch]))
+
+                if (epoch + 1) % self.save_point == 0:
+                    self.save(epoch + 1, path=file_path)
 
     def generate(self, base):
         noise = torch.randn(base.shape[0], self.noiseLength, device=self.device)
         print(type(base), type(noise))
         return self.net_g(Variable(base.float()), noise)
+
+    def save(self, epoch, path=None):
+        if path is None:
+            path = self.wkdir
+        torch.save({
+            'epoch': epoch,
+            'critic_state_dict': self.net_c.state_dict(),
+            'generator_state_dict': self.net_g.state_dict(),
+            'critic_optimizer_state_dict': self.optimiserC.state_dict(),
+            'generator_optimizer_state_dict': self.optimiserG.state_dict(),
+            # 'loss': loss,
+        }, path)
+
+    def load(self, file_path):
+        checkpoint = torch.load(file_path)
+        self.net_c.load_state_dict(checkpoint['critic_state_dict'])
+        self.net_g.load_state_dict(checkpoint['generator_state_dict'])
+        self.optimiserC.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        self.optimiserG.load_state_dict(checkpoint['generator_optimizer_state_dict'])
+        epoch = checkpoint['epoch']
+        return epoch
 
 
 class AddDimension(nn.Module):
